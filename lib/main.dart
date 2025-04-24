@@ -5,9 +5,20 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:image/image.dart' as img;
+import 'package:image_separator/screens/login_screen.dart';
+import 'package:image_separator/screens/profile_screen.dart';
+import 'package:image_separator/screens/splash_screen.dart';
+import 'package:image_separator/services/auth_service.dart';
 import 'blur_detector.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  
+  // Initialize test users for mock authentication
+  final authService = AuthService();
+  authService.addTestUsers();
+  print('Mock authentication initialized with test users');
+  
   runApp(const MyApp());
 }
 
@@ -22,7 +33,13 @@ class MyApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
         useMaterial3: true,
       ),
-      home: const ImageSeparatorScreen(),
+      initialRoute: '/',
+      routes: {
+        '/': (context) => const SplashScreen(),
+        '/login': (context) => const LoginScreen(),
+        '/home': (context) => const ImageSeparatorScreen(),
+        '/profile': (context) => const ProfileScreen(),
+      },
     );
   }
 }
@@ -49,11 +66,12 @@ class _ImageSeparatorScreenState extends State<ImageSeparatorScreen>
   final List<ImageFile> _selectedImages = [];
   final List<ImageFile> _goodImages = [];
   final List<ImageFile> _blurryImages = [];
+  final AuthService _authService = AuthService();
   bool _isProcessing = false;
   late TabController _tabController;
   
   // User-adjustable blur threshold
-  double _webBlurThreshold = 8.0; // Edge ratio threshold (%) - more aggressive default
+  double _webBlurThreshold = 40.0; // Combined score threshold - based on observed values
   double _nativeBlurThreshold = 2000.0;
 
   @override
@@ -122,19 +140,19 @@ class _ImageSeparatorScreenState extends State<ImageSeparatorScreen>
             imageFile.bytes = await imageFile.xFile.readAsBytes();
           }
           
-          // Try a completely different approach
+          // Advanced multi-metric blur detection for web
           final image = img.decodeImage(imageFile.bytes!);
           if (image == null) {
             isBlurry = true; // Can't decode
             imageFile.blurScore = 0;
           } else {
-            // Resize for faster processing
-            final smallImage = img.copyResize(image, width: 300);
+            // 1. Resize for faster processing
+            final smallImage = img.copyResize(image, width: 400, height: 400);
             
-            // 1. Convert to grayscale
+            // 2. Convert to grayscale
             final grayscale = img.grayscale(smallImage);
             
-            // 2. Compute simple edge detection
+            // ---------- METRIC 1: EDGE RATIO ----------
             int width = grayscale.width;
             int height = grayscale.height;
             int edgeCount = 0;
@@ -150,27 +168,97 @@ class _ImageSeparatorScreenState extends State<ImageSeparatorScreen>
                 int right = grayscale.getPixel(x + 1, y).r.toInt();
                 int bottom = grayscale.getPixel(x, y + 1).r.toInt();
                 
-                // Calculate difference
+                // Calculate difference - lower threshold for more sensitivity
                 int horizDiff = (center - right).abs();
                 int vertDiff = (center - bottom).abs();
                 
                 // If difference is significant, count as edge
-                if (horizDiff > 10 || vertDiff > 10) {
+                if (horizDiff > 5 || vertDiff > 5) {
                   edgeCount++;
                 }
               }
             }
             
-            // Edge ratio is our blur score - higher means sharper
             double edgeRatio = (edgeCount / pixelCount) * 100;
             
-            imageFile.blurScore = edgeRatio;
+            // ---------- METRIC 2: LAPLACIAN VARIANCE ----------
+            List<double> laplacianResponses = [];
             
-            // INVERTED LOGIC: Lower edge ratio = blurrier image
-            // Typically 5-15% for sharp images, 1-5% for blurry ones
-            print('Web edge ratio: $edgeRatio%');
+            // Laplacian kernel for edge detection
+            final laplacian = [
+               0.0,  1.0,  0.0,
+               1.0, -4.0,  1.0,
+               0.0,  1.0,  0.0
+            ];
             
-            isBlurry = edgeRatio < _webBlurThreshold; // Use the adjustable threshold
+            for (int y = 1; y < height - 1; y++) {
+              for (int x = 1; x < width - 1; x++) {
+                double sum = 0.0;
+                int kernelIndex = 0;
+                
+                for (int ky = -1; ky <= 1; ky++) {
+                  for (int kx = -1; kx <= 1; kx++) {
+                    final pixel = grayscale.getPixel(x + kx, y + ky);
+                    final int value = pixel.r.toInt();
+                    sum += value * laplacian[kernelIndex++];
+                  }
+                }
+                
+                laplacianResponses.add(sum * sum);
+              }
+            }
+            
+            // Mean of squared Laplacian responses
+            double laplacianScore = 0;
+            if (laplacianResponses.isNotEmpty) {
+              laplacianScore = laplacianResponses.reduce((a, b) => a + b) / laplacianResponses.length;
+            }
+            
+            // Normalize Laplacian score (typical range 0-3000)
+            double normalizedLaplacian = laplacianScore / 30.0;
+            
+            // ---------- METRIC 3: CONTRAST ----------
+            int minGray = 255;
+            int maxGray = 0;
+            double totalGray = 0;
+            int numPixels = 0;
+            
+            // Calculate min, max, and average gray values
+            for (int y = 0; y < height; y++) {
+              for (int x = 0; x < width; x++) {
+                final pixel = grayscale.getPixel(x, y);
+                final int gray = pixel.r.toInt();
+                
+                if (gray < minGray) minGray = gray;
+                if (gray > maxGray) maxGray = gray;
+                
+                totalGray += gray;
+                numPixels++;
+              }
+            }
+            
+            double avgGray = totalGray / numPixels;
+            double contrastScore = (maxGray - minGray).toDouble();
+            
+            // Normalize contrast (typical range 0-255)
+            double normalizedContrast = contrastScore / 2.55;
+            
+            // ---------- COMBINED SCORE ----------
+            // Weight the metrics and combine them
+            double combinedScore = (edgeRatio * 0.5) + (normalizedLaplacian * 0.3) + (normalizedContrast * 0.2);
+            
+            // Save the combined score
+            imageFile.blurScore = combinedScore;
+            
+            // Log all metrics for debugging
+            print('Image: ${imageFile.xFile.name}');
+            print('Edge ratio: $edgeRatio%');
+            print('Laplacian: $laplacianScore (normalized: $normalizedLaplacian)');
+            print('Contrast: $contrastScore (normalized: $normalizedContrast)');
+            print('Combined score: $combinedScore');
+            
+            // Compare with threshold (threshold should be based on combined score)
+            isBlurry = combinedScore < _webBlurThreshold;
           }
         } else {
           // On mobile/desktop, we can use the file path
@@ -225,11 +313,11 @@ class _ImageSeparatorScreenState extends State<ImageSeparatorScreen>
               content: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Text('Web Edge Ratio Threshold: ${_webBlurThreshold.toStringAsFixed(1)}%'),
+                  Text('Web Blur Threshold: ${_webBlurThreshold.toStringAsFixed(1)}'),
                   Slider(
-                    min: 1.0,
-                    max: 20.0,
-                    divisions: 190,
+                    min: 10.0,
+                    max: 50.0,
+                    divisions: 40,
                     value: _webBlurThreshold,
                     onChanged: (value) {
                       setState(() {
@@ -252,10 +340,10 @@ class _ImageSeparatorScreenState extends State<ImageSeparatorScreen>
                   ),
                   const SizedBox(height: 16),
                   const Text(
-                    'For web: Images with edge ratio below threshold are marked as blurry\n\n'
-                    'For non-web: Images with blur score below threshold are marked as blurry\n\n'
-                    'Increase thresholds to catch more blurry images\n\n'
-                    'TIP: You can also long-press any image to classify it manually',
+                    'For web: Using a combination of edge detection, Laplacian variance, and contrast\n\n'
+                    'For non-web: Using Laplacian variance method\n\n'
+                    'Higher threshold values = more images classified as blurry\n\n'
+                    'TIP: You can long-press any image to manually classify it if the automatic detection is incorrect',
                     style: TextStyle(fontSize: 12, fontStyle: FontStyle.italic),
                     textAlign: TextAlign.center,
                   ),
@@ -289,6 +377,12 @@ class _ImageSeparatorScreenState extends State<ImageSeparatorScreen>
           IconButton(
             icon: const Icon(Icons.settings),
             onPressed: _showSettingsDialog,
+          ),
+          IconButton(
+            icon: const Icon(Icons.account_circle),
+            onPressed: () {
+              Navigator.pushNamed(context, '/profile');
+            },
           ),
         ],
         bottom: TabBar(
